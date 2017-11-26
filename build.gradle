@@ -1,0 +1,217 @@
+import groovy.json.JsonSlurper
+import java.text.*
+import groovy.swing.SwingBuilder
+
+
+class TimeEntry {
+  Date date
+  Float hours
+  def issue
+  String activityName
+  String comments
+}
+
+class DailyData {
+  ArrayList<TimeEntry> activities
+  Float sumOfHours
+}
+
+class UsernamePasswordUI {
+  def username
+  def password
+  def show(defaultUsername){
+      new SwingBuilder().edt {
+        dialog(modal: true,
+            title: 'Authentication',
+            alwaysOnTop: true,
+            resizable: false,
+            locationRelativeTo: null,
+            size: [150, 100],
+            show: true
+        ) {
+          vbox {
+            label(text: "Username")
+            inputUsername = textField()
+            inputUsername.text = defaultUsername
+            label(text: "Password")
+            inputPassword = passwordField()
+            button(defaultButton: true, text: 'OK', actionPerformed: {
+              username = inputUsername.text
+              password = new String(inputPassword.password)
+              dispose();
+            })
+          }
+        }
+      }
+  }
+}
+
+class BugQuery {
+  static String urlBase
+  String url
+  String username
+  String password
+
+  def BugQuery(url, username, password){
+    this.url = url
+    this.username = username
+    this.password = password
+  }
+
+  def getData(){
+    def curl = "curl -s  -u ${username}:${password} ${urlBase}${url}"
+    def proc = curl.execute();
+    def outputStream = new StringBuffer();
+    def errorStream = new StringBuffer();
+    proc.waitForProcessOutput(outputStream, errorStream)
+    def jsonResponse =  outputStream.toString()
+    if (jsonResponse.size() > 0){
+      def jsonSlurper = new JsonSlurper()
+      jsonSlurper.parseText(jsonResponse)
+    }else{
+      println(errorStream.toString())
+      return null
+    }
+  }
+}
+
+class IssueQuery extends BugQuery {
+  def IssueQuery(username, password, id){
+    super("issues/${id}.json",username, password)
+  }
+
+  def getIssue(){
+    getData().issue
+  }
+}
+
+class TimeEntriesQuery extends BugQuery {
+  def TimeEntriesQuery(username, password){
+  super("time_entries.json?only_me=true&period_type=1&period=current_month&limit=200",username, password)
+  }
+
+  def getTimeEntries(){
+    def timeEntries = [:]
+    def data = getData()
+    if (data != null) {
+      def parsedJSON = data.time_entries
+      def spentOnFormat = new SimpleDateFormat("yyyy-MM-dd")
+
+      parsedJSON.each {
+        def entry = new TimeEntry()
+        entry.date = spentOnFormat.parse(it.spent_on)
+        entry.hours = it.hours
+        entry.issue = it.entity_id
+        entry.activityName = it.activity.name
+        entry.comments = it.comments
+
+        def date = entry.date.clearTime()
+        if (!timeEntries.containsKey(date)) {
+          timeEntries[date] = new DailyData()
+          timeEntries[date].activities = new ArrayList<TimeEntry>()
+          timeEntries[date].sumOfHours = 0
+        }
+        timeEntries[date].activities.add(entry)
+        timeEntries[date].sumOfHours += entry.hours
+      }
+    }
+    timeEntries
+  }
+}
+
+class TimeEntries extends DefaultTask {
+
+  static final WORKING_DAYS = [
+    10: [ //november
+                     2,  3,
+         6,  7,  8,  9, 10,
+        13, 14, 15, 16, 17,
+        20, 21, 22, 23, 24,
+        27, 28, 29, 30
+    ]
+  ]
+
+  static final String ANSI_RESET = "\u001B[0m";
+  static final String ANSI_BLACK = "\u001B[30m";
+  static final String ANSI_RED = "\u001B[31m";
+  static final String ANSI_GREEN = "\u001B[32m";
+  static final String ANSI_YELLOW = "\u001B[33m";
+  static final String ANSI_BLUE = "\u001B[34m";
+  static final String ANSI_PURPLE = "\u001B[35m";
+  static final String ANSI_CYAN = "\u001B[36m";
+  static final String ANSI_WHITE = "\u001B[37m";
+
+  @TaskAction
+  def getTimeEntries(){
+    def ui = new UsernamePasswordUI()
+    ui.show(project.username)
+
+    def username = ui.username
+    def pass = ui.password
+
+      if (username != "" && pass != "") {
+        BugQuery.urlBase = project.urlBase
+        def timeEntriesQuery = new TimeEntriesQuery(username, pass)
+        def timeEntries = timeEntriesQuery.getTimeEntries()
+
+      def Calendar monthCal = Calendar.getInstance()
+      monthCal.setTime(new Date())
+      def month = monthCal.get(Calendar.MONTH)
+      def workingDays = WORKING_DAYS[month]
+
+      def sum = 0
+
+      def issues = [:]
+
+      def firstLine = true
+
+      timeEntries.each { date, entries ->
+        def Calendar dayCal = Calendar.getInstance()
+        dayCal.setTime(date)
+        def day = dayCal.get(Calendar.DAY_OF_MONTH)
+        def daysBefore = workingDays.findAll { it <= day }
+        def neededHours = daysBefore.size * 7
+
+        sum += entries.sumOfHours
+        def diff = sum - neededHours
+        def color = diff == 0 ? ANSI_WHITE : (diff < 0 ? ANSI_RED : ANSI_GREEN)
+        def diffText = diff == 0 ? "" : (diff < 0 ? "${diff} " : "+${diff} ")
+        def starChar = firstLine ? "┌" : "├"
+        def endChar = firstLine ? "┐" : "┤"
+        println("${starChar}─ ${color}${date.format("YYYY-MM-dd")} (${entries.sumOfHours}) ${diffText}${ANSI_RESET}".padRight(78, "─") + "┬" + "".padRight(25, "─") + endChar)
+
+
+        entries.activities.each { entry ->
+          if (!issues.containsKey(entry.issue)){
+            issues[entry.issue] =  new IssueQuery(username, pass, entry.issue).getIssue()
+          }
+          def out = new StringBuffer()
+          out << "│" << entry.hours.toString().padLeft(4) << "│"
+          out << entry.activityName.padLeft(12) << "│"
+          def issueName = issues[entry.issue].subject
+          if (issueName.size() > 50){
+            issueName = issueName.substring(0,47) + "..."
+          }
+          out << issueName.padLeft(50) << "│"
+          def comments = entry.comments
+          if (!comments){
+            comments = ""
+          }
+          if (comments.size() > 25){
+            comments = comments.substring(0,22) + "..."
+          }
+          out << comments.padLeft(25) << "│"
+
+          println(out.toString())
+        }
+
+        def nothing = ""
+        println("└${"".padRight(4,"─")}┴${"".padRight(12,"─")}┴${"".padRight(50,"─")}┴${ANSI_WHITE}${ANSI_RESET}".padRight(104, "─") + "┘")
+        println()
+      }
+    }
+  }
+}
+
+task timeEntries(type: TimeEntries) {
+}
